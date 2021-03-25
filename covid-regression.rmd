@@ -21,6 +21,8 @@ knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse)
 library(caret)
 library(glmnet)
+
+options(scipen = 999)
 ```
 
 ## Load data
@@ -57,9 +59,21 @@ ggplot(data_covid, aes(x = deaths_per1000)) + geom_density()
   - trump: pct_report, votes, total_votes, pct, lead, 
   - demography: TotalPop, Men, Women, Hispanic, White, Black, Native, Asian, Pacific, VotingAgeCitizen, Income, IncomePerCap, Poverty, ChildPoverty, Professional, Service, Office, Construction, Production, Drive, Carpool, Transit, Walk, OtherTransp, WorkAtHome, MeanCommute, Employed, PrivateWork, PublicWork, SelfEmployed, FamilyWork, Unemployment
 - What do you think should be included as the inputs?
-
+- Some of the vote variables are duplicates. I think only use PCT. 
 
 ```{r}
+
+data_covid %>%
+  select(!c(lead, pct_report, votes, total_votes)) %>%
+  pivot_longer(pct:Unemployment, names_to = "variable") %>%
+  ggplot(aes(y = deaths_per1000, x = value)) +
+  geom_point(color = "blue", alpha = .3) +
+  facet_wrap(~variable, scales = "free_x")
+
+#create a subset
+data_covid_sub <- data_covid %>%
+  select(!c(lead, pct_report, votes, total_votes, Women)) %>%
+  select(pct:deaths_per1000)
 
 ```
 
@@ -75,12 +89,27 @@ Using `caret` (or something else if you like), prepare two datasets of pre-proce
 ## Train-test split
 
 ```{r}
+#use caret. 
+#caret
+set.seed(20210325)
+partition <- createDataPartition(data_covid_sub$deaths_per1000, p = .8, list = F)
+Covid_train_c <- data_covid_sub %>%
+  slice(partition)
+Covid_test_c <- data_covid_sub %>%
+  slice(-partition)
 
 ```
 
 ## Preprocess
 
 ```{r}
+#preprocessing
+Covid_train_X <- Covid_train_c %>%
+  select(-deaths_per1000)
+
+Covid_prep <- preProcess(x=Covid_train_X, method=c("center", "scale"))
+Covid_train_c_processed <- predict(Covid_prep, Covid_train_c)
+Covid_test_c_processed <- predict(Covid_prep, Covid_test_c)
 
 ```
 
@@ -93,9 +122,50 @@ Using `caret` (or something else if you like), prepare two datasets of pre-proce
 - Evaluate the model
 
 ```{r}
+covid_lm_full <- lm(deaths_per1000 ~ ., 
+   data = Covid_train_c_processed)
 
 ```
+
 ```{r}
+#calculate the RMSE
+Y_train <- Covid_train_c_processed$deaths_per1000
+Y_hat_train_lm_full <- predict(covid_lm_full)
+
+RMSE_train_lm_full <- (Y_train - Y_hat_train_lm_full)^2 %>% mean %>% sqrt()
+
+Y_test <- Covid_test_c_processed$deaths_per1000
+Y_hat_test_lm_full <- predict(covid_lm_full, newdata = Covid_test_c_processed)
+
+RMSE_test_lm_full <- (Y_test - Y_hat_test_lm_full)^2 %>% mean %>% sqrt()
+
+RMSE_train_lm_full
+RMSE_test_lm_full
+
+#plot the predictions
+plot_data_1 <- data.frame(
+  Y = Covid_train_c_processed$deaths_per1000,
+  Y_hat = Y_hat_train_lm_full,
+  train = 1
+)
+plot_data_2 <- data.frame(
+  Y = Covid_test_c_processed$deaths_per1000,
+  Y_hat = Y_hat_test_lm_full,
+  train = 0
+)
+bind_rows(plot_data_1, plot_data_2) %>%
+  ggplot(aes(x = Y_hat, y = Y)) + 
+  geom_point(alpha = .3) +
+  facet_grid(.~train)
+
+#install.packages('leaps')
+library(leaps)
+covid_forward <- regsubsets(deaths_per1000 ~., data = Covid_train_c_processed,
+                          nbest=1, nvmax=33, method = "forward")
+summary(covid_forward)
+covid_backward <- regsubsets(deaths_per1000 ~., data = Covid_train_c_processed,
+                          nbest=1, nvmax=33, method = "backward")
+summary(covid_backward)
 
 ```
 
@@ -112,6 +182,44 @@ Using the linear regression model as the baseline we attempt two things:
       
 
 ```{r}
+#use KNN regression.
+#cross validation. 
+#knn, only one parameter now
+#create grid of all possible combinations. 
+tuning_grid <- expand.grid(k = c(3,4,5,6,8,10,20,30))
+tuning_grid
+
+#cv steps
+set.seed(20210325)
+ctrl <- trainControl(method = "repeatedcv",
+                     number = 5,
+                     repeats = 3)
+
+Covid_knn <- train(deaths_per1000 ~ .,
+                    data = Covid_train_c_processed,
+                    method = "knn",
+                    trControl = ctrl,
+                    tuneGrid = tuning_grid)
+
+Covid_knn
+
+plot(Covid_knn)
+
+
+#prediction plots. 
+y_hat <- predict(Covid_knn)
+y_hat_test <- predict(Covid_knn, newdata = Covid_test_c_processed)
+
+Covid_train_c_processed %>% mutate(y_hat = y_hat) %>%
+  ggplot(aes(x = y_hat, y = deaths_per1000)) +
+  geom_point(alpha = .3)
+
+Covid_test_c_processed %>% mutate(y_hat_test = y_hat_test) %>%
+  ggplot(aes(x = y_hat_test, y = deaths_per1000)) +
+  geom_point(alpha = .3)
+
+#so KNN is not better than full OLS. 
+RMSE_test_KNN <- (Covid_test_c_processed$deaths_per1000 - y_hat_test)^2 %>% mean %>% sqrt()
 
 ```
 
@@ -125,7 +233,46 @@ Using the linear regression model as the baseline we attempt two things:
 ### LASSO Outcome
 
 ```{r}
+#regularized regression.
+#glmnet
+library(glmnet)
 
+#lasso and rdige regression. 
+#cv.glmnet() conduct cross-validation for parameter truning
+
+#dataprep for glmnet
+Covid_train_X <- Covid_train_c_processed %>%
+  select(-deaths_per1000) %>% as.matrix()
+Covid_train_Y <- Covid_train_c_processed$deaths_per1000
+
+Covid_test_X <- Covid_test_c_processed %>%
+  select(-deaths_per1000) %>% as.matrix()
+Covid_test_Y <- Covid_test_c_processed$deaths_per1000
+
+
+#Lasso regression
+Covid_lasso_cv <- cv.glmnet(Covid_train_X,
+                             Covid_train_Y,
+                             alpha = 1,
+                             type.measure = "mse",
+                             family = "gaussian")
+
+plot(Covid_lasso_cv)
+
+Covid_lasso_cv$lambda.1se
+Covid_lasso_cv$lambda.min
+
+plot(Covid_lasso_cv$glmnet.fit, 
+     xvar = "lambda", abline(v = log(Covid_lasso_cv$lambda.1se)))
+
+
+#check the RMSE.
+RMSE_train_lasso <- (Covid_train_c_processed$deaths_per1000 - as.vector(predict(Covid_lasso_cv,Covid_train_X)))^2 %>% mean %>% sqrt()
+
+RMSE_test_lasso <- (Covid_test_c_processed$deaths_per1000 - as.vector(predict(Covid_lasso_cv,Covid_test_X)))^2 %>% mean %>% sqrt()
+
+RMSE_test_lasso
+RMSE_train_lasso
 ```
 
 
@@ -133,17 +280,39 @@ Using the linear regression model as the baseline we attempt two things:
 ### Ridge regression outcome
 
 ```{r}
+#Ridge regression
+Covid_ridge_cv <- cv.glmnet(Covid_train_X,
+                             Covid_train_Y,
+                             alpha = 0,
+                             type.measure = "mse",
+                             family = "gaussian")
 
+plot(Covid_ridge_cv)
+
+Covid_ridge_cv$lambda.1se
+Covid_ridge_cv$lambda.min
+
+plot(Covid_ridge_cv$glmnet.fit, xvar = "lambda")
+
+RMSE_train_ridge <- (Covid_train_c_processed$deaths_per1000 - as.vector(predict(Covid_ridge_cv,Covid_train_X)))^2 %>% mean %>% sqrt()
+
+RMSE_test_ridge <- (Covid_test_c_processed$deaths_per1000 - as.vector(predict(Covid_ridge_cv,Covid_test_X)))^2 %>% mean %>% sqrt()
+
+RMSE_test_ridge
+RMSE_train_ridge
 
 ```
 
 
 ### Compare coefs: lm, lasso/ridge
 
-Compare the cefficients across the models. What do you find?
-
+Compare the coefficients across the models. What do you find?
+ - Matters a lot, we see a shrinkage of the coefficients. 
+ - Yet, the penalized forms do not really fit better than LM. 
+ - But, LASSO model is much simpler and performs similar to LM OLS so that is to be preferred. 
 ```{r}
+cbind(coef(Covid_ridge_cv), coef(Covid_lasso_cv), coef(covid_lm_full))
 
-  
+
 
 ```
